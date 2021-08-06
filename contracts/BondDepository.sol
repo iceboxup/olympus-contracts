@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 pragma solidity 0.7.5;
+pragma abicoder v2;
 
 interface IOwnable {
   function policy() external view returns (address);
@@ -613,10 +614,32 @@ contract OlympusBondDepository is Ownable {
 
     /* ======== EVENTS ======== */
 
-    event BondCreated( uint deposit, uint indexed payout, uint indexed expires, uint indexed priceInUSD );
-    event BondRedeemed( address indexed recipient, uint payout, uint remaining );
-    event BondPriceChanged( uint indexed priceInUSD, uint indexed internalPrice, uint indexed debtRatio );
-    event ControlVariableAdjustment( uint initialBCV, uint newBCV, uint adjustment, bool addition );
+    event BondCreated(
+        uint bondDepositoryIndex,
+        uint deposit,
+        uint indexed payout,
+        uint indexed expires,
+        uint indexed priceInUSD
+    );
+    event BondRedeemed(
+        uint bondDepositoryIndex,
+        address indexed recipient,
+        uint payout,
+        uint remaining
+    );
+    event BondPriceChanged(
+        uint bondDepositoryIndex,
+        uint indexed priceInUSD,
+        uint indexed internalPrice,
+        uint indexed debtRatio
+    );
+    event ControlVariableAdjustment(
+        uint bondDepositoryIndex,
+        uint initialBCV,
+        uint newBCV,
+        uint adjustment,
+        bool addition
+    );
 
 
 
@@ -624,32 +647,42 @@ contract OlympusBondDepository is Ownable {
     /* ======== STATE VARIABLES ======== */
 
     address public immutable OHM; // token given as payment for bond
-    address public immutable principle; // token used to create bond
     address public immutable treasury; // mints OHM when receives principle
     address public immutable DAO; // receives profit share from bond
 
-    bool public immutable isLiquidityBond; // LP and Reserve bonds are treated slightly different
-    address public immutable bondCalculator; // calculates value of LP tokens
-
-    address public staking; // to auto-stake payout
-    address public stakingHelper; // to stake and claim if no staking warmup
-    bool public useHelper;
-
-    Terms public terms; // stores terms for new bonds
-    Adjust public adjustment; // stores adjustment to BCV data
-
-    mapping( address => Bond ) public bondInfo; // stores bond information for depositors
-
-    uint public totalDebt; // total value of outstanding bonds; used for pricing
-    uint public lastDecay; // reference block for debt decay
-
-
-
+    BondDepository[] public bondDepositories;
+    mapping(uint256 => BondDepositoryStaking) bondDepositoriesStaking;
+    mapping(uint256 => BondDepositoryDebt) bondDepositoriesDebts;
+    mapping(uint256 => BondDepositoryTerms) bondDepositoriesTerms;
+    mapping(uint256 => BondDepositoryAdjust) bondDepositoriesAdjustments;
+    // stores bond information for depositors. bond depository => depositor => bond information
+    mapping(uint256 => mapping(address => BondInfo)) bondInfo;
 
     /* ======== STRUCTS ======== */
 
+    // Info for bond depository
+    struct BondDepository {
+        address principle; // token used to create bond
+
+        bool isLiquidityBond; // LP and Reserve bonds are treated slightly different
+        address bondCalculator; // calculates value of LP tokens
+    }
+
+    // Info for bonds staking
+    struct BondDepositoryStaking {
+        address staking; // to auto-stake payout
+        address stakingHelper; // to stake and claim if no staking warmup
+        bool useHelper;
+    }
+
+    // Info for bonds debt
+    struct BondDepositoryDebt {
+        uint totalDebt; // total value of outstanding bonds; used for pricing
+        uint lastDecay; // reference block for debt decay
+    }
+
     // Info for creating new bonds
-    struct Terms {
+    struct BondDepositoryTerms {
         uint controlVariable; // scaling variable for price
         uint vestingTerm; // in blocks
         uint minimumPrice; // vs principle value
@@ -658,16 +691,8 @@ contract OlympusBondDepository is Ownable {
         uint maxDebt; // 9 decimal debt ratio, max % total supply created as debt
     }
 
-    // Info for bond holder
-    struct Bond {
-        uint payout; // OHM remaining to be paid
-        uint vesting; // Blocks left to vest
-        uint lastBlock; // Last interaction
-        uint pricePaid; // In DAI, for front end viewing
-    }
-
     // Info for incremental adjustments to control variable 
-    struct Adjust {
+    struct BondDepositoryAdjust {
         bool add; // addition or subtraction
         uint rate; // increment
         uint target; // BCV when adjustment finished
@@ -675,6 +700,13 @@ contract OlympusBondDepository is Ownable {
         uint lastBlock; // block when last adjustment made
     }
 
+    // Info for bond holder
+    struct BondInfo {
+        uint payout; // OHM remaining to be paid
+        uint vesting; // Blocks left to vest
+        uint lastBlock; // Last interaction
+        uint pricePaid; // In DAI, for front end viewing
+    }
 
 
 
@@ -682,26 +714,34 @@ contract OlympusBondDepository is Ownable {
 
     constructor ( 
         address _OHM,
-        address _principle,
         address _treasury, 
-        address _DAO, 
-        address _bondCalculator
+        address _DAO
     ) {
         require( _OHM != address(0) );
         OHM = _OHM;
-        require( _principle != address(0) );
-        principle = _principle;
         require( _treasury != address(0) );
         treasury = _treasury;
         require( _DAO != address(0) );
         DAO = _DAO;
+
+    }
+
+    function createBondDepository(address _principle, address _bondCalculator) external onlyPolicy() {
+        BondDepository memory bondDepository;
+
+        require( _principle != address(0) );
+        bondDepository.principle = _principle;
+
         // bondCalculator should be address(0) if not LP bond
-        bondCalculator = _bondCalculator;
-        isLiquidityBond = ( _bondCalculator != address(0) );
+        bondDepository.bondCalculator = _bondCalculator;
+        bondDepository.isLiquidityBond = ( _bondCalculator != address(0) );
+
+        bondDepositories.push(bondDepository);
     }
 
     /**
      *  @notice initializes bond parameters
+     *  @param _bondDepositoryId The index of bond depositories
      *  @param _controlVariable uint
      *  @param _vestingTerm uint
      *  @param _minimumPrice uint
@@ -711,6 +751,7 @@ contract OlympusBondDepository is Ownable {
      *  @param _initialDebt uint
      */
     function initializeBondTerms( 
+        uint _bondDepositoryId,
         uint _controlVariable, 
         uint _vestingTerm,
         uint _minimumPrice,
@@ -719,8 +760,12 @@ contract OlympusBondDepository is Ownable {
         uint _maxDebt,
         uint _initialDebt
     ) external onlyPolicy() {
-        require( terms.controlVariable == 0, "Bonds must be initialized from 0" );
-        terms = Terms ({
+        require(_bondDepositoryId < bondDepositories.length, "Invalid bond depository index");
+
+        BondDepositoryDebt storage debt = bondDepositoriesDebts[_bondDepositoryId];
+
+        require( bondDepositoriesTerms[_bondDepositoryId].controlVariable == 0, "Bonds must be initialized from 0" );
+        bondDepositoriesTerms[_bondDepositoryId] = BondDepositoryTerms ({
             controlVariable: _controlVariable,
             vestingTerm: _vestingTerm,
             minimumPrice: _minimumPrice,
@@ -728,8 +773,8 @@ contract OlympusBondDepository is Ownable {
             fee: _fee,
             maxDebt: _maxDebt
         });
-        totalDebt = _initialDebt;
-        lastDecay = block.number;
+        debt.totalDebt = _initialDebt;
+        debt.lastDecay = block.number;
     }
 
 
@@ -740,10 +785,15 @@ contract OlympusBondDepository is Ownable {
     enum PARAMETER { VESTING, PAYOUT, FEE, DEBT }
     /**
      *  @notice set parameters for new bonds
+     *  @param _bondDepositoryId The index of bond depositories
      *  @param _parameter PARAMETER
      *  @param _input uint
      */
-    function setBondTerms ( PARAMETER _parameter, uint _input ) external onlyPolicy() {
+    function setBondTerms ( uint _bondDepositoryId, PARAMETER _parameter, uint _input ) external onlyPolicy() {
+        require(_bondDepositoryId < bondDepositories.length, "Invalid bond depository index");
+
+        BondDepositoryTerms storage terms = bondDepositoriesTerms[_bondDepositoryId];
+
         if ( _parameter == PARAMETER.VESTING ) { // 0
             require( _input >= 10000, "Vesting must be longer than 36 hours" );
             terms.vestingTerm = _input;
@@ -760,20 +810,28 @@ contract OlympusBondDepository is Ownable {
 
     /**
      *  @notice set control variable adjustment
+     *  @param _bondDepositoryId The index of bond depositories
      *  @param _addition bool
      *  @param _increment uint
      *  @param _target uint
      *  @param _buffer uint
      */
     function setAdjustment ( 
+        uint _bondDepositoryId,
         bool _addition,
         uint _increment, 
         uint _target,
         uint _buffer 
     ) external onlyPolicy() {
-        require( _increment <= terms.controlVariable.mul( 25 ).div( 1000 ), "Increment too large" );
+        require(_bondDepositoryId < bondDepositories.length, "Invalid bond depository index");
 
-        adjustment = Adjust({
+        require(
+            _increment <=
+                bondDepositoriesTerms[_bondDepositoryId].controlVariable.mul( 25 ).div( 1000 ),
+            "Increment too large"
+        );
+
+        bondDepositoriesAdjustments[_bondDepositoryId] = BondDepositoryAdjust({
             add: _addition,
             rate: _increment,
             target: _target,
@@ -784,17 +842,22 @@ contract OlympusBondDepository is Ownable {
 
     /**
      *  @notice set contract for auto stake
+     *  @param _bondDepositoryId The index of bond depositories
      *  @param _staking address
      *  @param _helper bool
      */
-    function setStaking( address _staking, bool _helper ) external onlyPolicy() {
+    function setStaking( uint _bondDepositoryId, address _staking, bool _helper ) external onlyPolicy() {
+        require(_bondDepositoryId < bondDepositories.length, "Invalid bond depository index");
+
+        BondDepositoryStaking  storage bondDepositoryStaking = bondDepositoriesStaking[_bondDepositoryId];
+
         require( _staking != address(0) );
         if ( _helper ) {
-            useHelper = true;
-            stakingHelper = _staking;
+            bondDepositoryStaking.useHelper = true;
+            bondDepositoryStaking.stakingHelper = _staking;
         } else {
-            useHelper = false;
-            staking = _staking;
+            bondDepositoryStaking.useHelper = false;
+            bondDepositoryStaking.staking = _staking;
         }
     }
 
@@ -805,97 +868,94 @@ contract OlympusBondDepository is Ownable {
 
     /**
      *  @notice deposit bond
+     *  @param _bondDepositoryId The index of bond depositories
      *  @param _amount uint
      *  @param _maxPrice uint
      *  @param _depositor address
      *  @return uint
      */
     function deposit( 
+        uint _bondDepositoryId,
         uint _amount, 
         uint _maxPrice,
         address _depositor
     ) external returns ( uint ) {
+        require(_bondDepositoryId < bondDepositories.length, "Invalid bond depository index");
+
         require( _depositor != address(0), "Invalid address" );
 
-        decayDebt();
-        require( totalDebt <= terms.maxDebt, "Max capacity reached" );
+        decayDebt(_bondDepositoryId);
+
+        BondDepositoryDebt storage bondDepositoryDebt = bondDepositoriesDebts[_bondDepositoryId];
+        BondDepositoryTerms memory terms = bondDepositoriesTerms[_bondDepositoryId];
+
+        require( bondDepositoryDebt.totalDebt <= terms.maxDebt, "Max capacity reached" );
         
-        uint priceInUSD = bondPriceInUSD(); // Stored in bond info
-        uint nativePrice = _bondPrice();
+        uint priceInUSD = bondPriceInUSD(_bondDepositoryId); // Stored in bond info
+        uint nativePrice = _bondPrice(_bondDepositoryId);
 
         require( _maxPrice >= nativePrice, "Slippage limit: more than max price" ); // slippage protection
 
-        uint value = ITreasury( treasury ).valueOf( principle, _amount );
-        uint payout = payoutFor( value ); // payout to bonder is computed
-
-        require( payout >= 10000000, "Bond too small" ); // must be > 0.01 OHM ( underflow protection )
-        require( payout <= maxPayout(), "Bond too large"); // size protection because there is no slippage
-
-        // profits are calculated
-        uint fee = payout.mul( terms.fee ).div( 10000 );
-        uint profit = value.sub( payout ).sub( fee );
-
-        /**
-            principle is transferred in
-            approved and
-            deposited into the treasury, returning (_amount - profit) OHM
-         */
-        IERC20( principle ).safeTransferFrom( msg.sender, address(this), _amount );
-        IERC20( principle ).approve( address( treasury ), _amount );
-        ITreasury( treasury ).deposit( _amount, principle, profit );
-        
-        if ( fee != 0 ) { // fee is transferred to dao 
-            IERC20( OHM ).safeTransfer( DAO, fee ); 
-        }
+        (uint value, uint payout) = _deposit(_bondDepositoryId, _amount);
         
         // total debt is increased
-        totalDebt = totalDebt.add( value ); 
+        bondDepositoryDebt.totalDebt = bondDepositoryDebt.totalDebt.add( value ); 
                 
         // depositor info is stored
-        bondInfo[ _depositor ] = Bond({ 
-            payout: bondInfo[ _depositor ].payout.add( payout ),
-            vesting: terms.vestingTerm,
-            lastBlock: block.number,
-            pricePaid: priceInUSD
-        });
+        BondInfo storage info = bondInfo[_bondDepositoryId][ _depositor ];
+        info.payout = info.payout.add(payout);
+        info.vesting = terms.vestingTerm;
+        info.lastBlock = block.number;
+        info.pricePaid = priceInUSD;
 
         // indexed events are emitted
-        emit BondCreated( _amount, payout, block.number.add( terms.vestingTerm ), priceInUSD );
-        emit BondPriceChanged( bondPriceInUSD(), _bondPrice(), debtRatio() );
+        emit BondCreated( _bondDepositoryId, _amount, payout, block.number.add( terms.vestingTerm ), priceInUSD );
+        emit BondPriceChanged(
+            _bondDepositoryId,
+            bondPriceInUSD(_bondDepositoryId),
+            _bondPrice(_bondDepositoryId),
+            debtRatio(_bondDepositoryId)
+        );
 
-        adjust(); // control variable is adjusted
+        adjust(_bondDepositoryId); // control variable is adjusted
         return payout; 
     }
 
     /** 
      *  @notice redeem bond for user
+     *  @param _bondDepositoryId The index of bond depositories
      *  @param _recipient address
      *  @param _stake bool
      *  @return uint
      */ 
-    function redeem( address _recipient, bool _stake ) external returns ( uint ) {        
-        Bond memory info = bondInfo[ _recipient ];
-        uint percentVested = percentVestedFor( _recipient ); // (blocks since last interaction / vesting term remaining)
+    function redeem( uint _bondDepositoryId, address _recipient, bool _stake ) external returns ( uint ) {    
+        require(_bondDepositoryId < bondDepositories.length, "Invalid bond depository index");
+
+        BondInfo memory info = bondInfo[_bondDepositoryId][ _recipient ];
+
+        // (blocks since last interaction / vesting term remaining)
+        uint percentVested = percentVestedFor( _bondDepositoryId, _recipient );
 
         if ( percentVested >= 10000 ) { // if fully vested
-            delete bondInfo[ _recipient ]; // delete user info
-            emit BondRedeemed( _recipient, info.payout, 0 ); // emit bond data
-            return stakeOrSend( _recipient, _stake, info.payout ); // pay user everything due
+            delete bondInfo[_bondDepositoryId][ _recipient ]; // delete user info
+            emit BondRedeemed( _bondDepositoryId, _recipient, info.payout, 0 ); // emit bond data
+            return stakeOrSend( _bondDepositoryId, _recipient, _stake, info.payout ); // pay user everything due
 
         } else { // if unfinished
             // calculate payout vested
             uint payout = info.payout.mul( percentVested ).div( 10000 );
 
+            uint remainingPayout = info.payout.sub( payout );
             // store updated deposit info
-            bondInfo[ _recipient ] = Bond({
-                payout: info.payout.sub( payout ),
+            bondInfo[_bondDepositoryId][ _recipient ] = BondInfo({
+                payout: remainingPayout,
                 vesting: info.vesting.sub( block.number.sub( info.lastBlock ) ),
                 lastBlock: block.number,
                 pricePaid: info.pricePaid
             });
 
-            emit BondRedeemed( _recipient, payout, bondInfo[ _recipient ].payout );
-            return stakeOrSend( _recipient, _stake, payout );
+            emit BondRedeemed( _bondDepositoryId, _recipient, payout, remainingPayout );
+            return stakeOrSend( _bondDepositoryId, _recipient, _stake, payout );
         }
     }
 
@@ -905,21 +965,71 @@ contract OlympusBondDepository is Ownable {
     /* ======== INTERNAL HELPER FUNCTIONS ======== */
 
     /**
+     *  @notice deposit bond
+     *  @param _bondDepositoryId The index of bond depositories
+     *  @param _amount uint
+     */
+    function _deposit(
+        uint _bondDepositoryId,
+        uint _amount
+    ) internal returns (uint value, uint payout) {
+        address principle = bondDepositories[_bondDepositoryId].principle;
+
+        value = ITreasury( treasury ).valueOf( principle, _amount );
+        payout = payoutFor( _bondDepositoryId, value ); // payout to bonder is computed
+
+        require( payout >= 10000000, "BondInfo too small" ); // must be > 0.01 OHM ( underflow protection )
+        require(
+            payout <= maxPayout(_bondDepositoryId),
+            "BondInfo too large"
+        ); // size protection because there is no slippage
+
+        IERC20( principle ).safeTransferFrom( msg.sender, address(this), _amount );
+
+        // profits are calculated
+        BondDepositoryTerms memory terms = bondDepositoriesTerms[_bondDepositoryId];
+        uint fee = payout.mul( terms.fee ).div( 10000 );
+        uint profit = value.sub( payout ).sub( fee );
+
+        /**
+            principle is transferred in
+            approved and
+            deposited into the treasury, returning (_amount - profit) OHM
+         */
+        IERC20( principle ).approve( address( treasury ), _amount );
+        ITreasury( treasury ).deposit( _amount, principle, profit );
+        
+        if ( fee != 0 ) { // fee is transferred to dao 
+            IERC20( OHM ).safeTransfer( DAO, fee ); 
+        }
+    }
+
+    /**
      *  @notice allow user to stake payout automatically
+     *  @param _bondDepositoryId The index of bond depositories
      *  @param _stake bool
      *  @param _amount uint
      *  @return uint
      */
-    function stakeOrSend( address _recipient, bool _stake, uint _amount ) internal returns ( uint ) {
+    function stakeOrSend(
+        uint _bondDepositoryId,
+        address _recipient,
+        bool _stake,
+        uint _amount
+    ) internal returns ( uint ) {
+        require(_bondDepositoryId < bondDepositories.length, "Invalid bond depository index");
+
+        BondDepositoryStaking memory bondDepositoryStaking = bondDepositoriesStaking[_bondDepositoryId];
+
         if ( !_stake ) { // if user does not want to stake
             IERC20( OHM ).transfer( _recipient, _amount ); // send payout
         } else { // if user wants to stake
-            if ( useHelper ) { // use if staking warmup is 0
-                IERC20( OHM ).approve( stakingHelper, _amount );
-                IStakingHelper( stakingHelper ).stake( _amount, _recipient );
+            if ( bondDepositoryStaking.useHelper ) { // use if staking warmup is 0
+                IERC20( OHM ).approve( bondDepositoryStaking.stakingHelper, _amount );
+                IStakingHelper( bondDepositoryStaking.stakingHelper ).stake( _amount, _recipient );
             } else {
-                IERC20( OHM ).approve( staking, _amount );
-                IStaking( staking ).stake( _amount, _recipient );
+                IERC20( OHM ).approve( bondDepositoryStaking.staking, _amount );
+                IStaking( bondDepositoryStaking.staking ).stake( _amount, _recipient );
             }
         }
         return _amount;
@@ -928,7 +1038,10 @@ contract OlympusBondDepository is Ownable {
     /**
      *  @notice makes incremental adjustment to control variable
      */
-    function adjust() internal {
+    function adjust(uint _bondDepositoryId) internal {
+        BondDepositoryTerms storage terms = bondDepositoriesTerms[_bondDepositoryId];
+        BondDepositoryAdjust storage adjustment = bondDepositoriesAdjustments[_bondDepositoryId];
+
         uint blockCanAdjust = adjustment.lastBlock.add( adjustment.buffer );
         if( adjustment.rate != 0 && block.number >= blockCanAdjust ) {
             uint initial = terms.controlVariable;
@@ -944,16 +1057,23 @@ contract OlympusBondDepository is Ownable {
                 }
             }
             adjustment.lastBlock = block.number;
-            emit ControlVariableAdjustment( initial, terms.controlVariable, adjustment.rate, adjustment.add );
+            emit ControlVariableAdjustment(
+                _bondDepositoryId,
+                initial,
+                terms.controlVariable,
+                adjustment.rate,
+                adjustment.add
+            );
         }
     }
 
     /**
      *  @notice reduce total debt
      */
-    function decayDebt() internal {
-        totalDebt = totalDebt.sub( debtDecay() );
-        lastDecay = block.number;
+    function decayDebt(uint _bondDepositoryId) internal {
+        BondDepositoryDebt storage bondDepositoryDebt = bondDepositoriesDebts[_bondDepositoryId];
+        bondDepositoryDebt.totalDebt = bondDepositoryDebt.totalDebt.sub( debtDecay(_bondDepositoryId) );
+        bondDepositoryDebt.lastDecay = block.number;
     }
 
 
@@ -965,8 +1085,8 @@ contract OlympusBondDepository is Ownable {
      *  @notice determine maximum bond size
      *  @return uint
      */
-    function maxPayout() public view returns ( uint ) {
-        return IERC20( OHM ).totalSupply().mul( terms.maxPayout ).div( 100000 );
+    function maxPayout(uint _bondDepositoryId) public view returns ( uint ) {
+        return IERC20( OHM ).totalSupply().mul( bondDepositoriesTerms[_bondDepositoryId].maxPayout ).div( 100000 );
     }
 
     /**
@@ -974,8 +1094,8 @@ contract OlympusBondDepository is Ownable {
      *  @param _value uint
      *  @return uint
      */
-    function payoutFor( uint _value ) public view returns ( uint ) {
-        return FixedPoint.fraction( _value, bondPrice() ).decode112with18().div( 1e16 );
+    function payoutFor( uint _bondDepositoryId, uint _value ) public view returns ( uint ) {
+        return FixedPoint.fraction( _value, bondPrice(_bondDepositoryId) ).decode112with18().div( 1e16 );
     }
 
 
@@ -983,8 +1103,10 @@ contract OlympusBondDepository is Ownable {
      *  @notice calculate current bond premium
      *  @return price_ uint
      */
-    function bondPrice() public view returns ( uint price_ ) {        
-        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ).div( 1e7 );
+    function bondPrice(uint _bondDepositoryId) public view returns ( uint price_ ) {        
+        BondDepositoryTerms memory terms = bondDepositoriesTerms[_bondDepositoryId];
+
+        price_ = terms.controlVariable.mul( debtRatio(_bondDepositoryId) ).add( 1000000000 ).div( 1e7 );
         if ( price_ < terms.minimumPrice ) {
             price_ = terms.minimumPrice;
         }
@@ -994,8 +1116,10 @@ contract OlympusBondDepository is Ownable {
      *  @notice calculate current bond price and remove floor if above
      *  @return price_ uint
      */
-    function _bondPrice() internal returns ( uint price_ ) {
-        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ).div( 1e7 );
+    function _bondPrice(uint _bondDepositoryId) internal returns ( uint price_ ) {
+        BondDepositoryTerms storage terms = bondDepositoriesTerms[_bondDepositoryId];
+        
+        price_ = terms.controlVariable.mul( debtRatio(_bondDepositoryId) ).add( 1000000000 ).div( 1e7 );
         if ( price_ < terms.minimumPrice ) {
             price_ = terms.minimumPrice;        
         } else if ( terms.minimumPrice != 0 ) {
@@ -1007,11 +1131,15 @@ contract OlympusBondDepository is Ownable {
      *  @notice converts bond price to DAI value
      *  @return price_ uint
      */
-    function bondPriceInUSD() public view returns ( uint price_ ) {
-        if( isLiquidityBond ) {
-            price_ = bondPrice().mul( IBondCalculator( bondCalculator ).markdown( principle ) ).div( 100 );
+    function bondPriceInUSD(uint _bondDepositoryId) public view returns ( uint price_ ) {
+        BondDepository memory bondDepository = bondDepositories[_bondDepositoryId];
+
+        if( bondDepository.isLiquidityBond ) {
+            price_ = bondPrice(_bondDepositoryId).mul(
+                IBondCalculator( bondDepository.bondCalculator ).markdown( bondDepository.principle )
+            ).div( 100 );
         } else {
-            price_ = bondPrice().mul( 10 ** IERC20( principle ).decimals() ).div( 100 );
+            price_ = bondPrice(_bondDepositoryId).mul( 10 ** IERC20( bondDepository.principle ).decimals() ).div( 100 );
         }
     }
 
@@ -1020,10 +1148,10 @@ contract OlympusBondDepository is Ownable {
      *  @notice calculate current ratio of debt to OHM supply
      *  @return debtRatio_ uint
      */
-    function debtRatio() public view returns ( uint debtRatio_ ) {   
+    function debtRatio(uint _bondDepositoryId) public view returns ( uint debtRatio_ ) {   
         uint supply = IERC20( OHM ).totalSupply();
         debtRatio_ = FixedPoint.fraction( 
-            currentDebt().mul( 1e9 ), 
+            currentDebt(_bondDepositoryId).mul( 1e9 ), 
             supply
         ).decode112with18().div( 1e18 );
     }
@@ -1032,11 +1160,15 @@ contract OlympusBondDepository is Ownable {
      *  @notice debt ratio in same terms for reserve or liquidity bonds
      *  @return uint
      */
-    function standardizedDebtRatio() external view returns ( uint ) {
-        if ( isLiquidityBond ) {
-            return debtRatio().mul( IBondCalculator( bondCalculator ).markdown( principle ) ).div( 1e9 );
+    function standardizedDebtRatio(uint _bondDepositoryId) external view returns ( uint ) {
+        BondDepository memory bondDepository = bondDepositories[_bondDepositoryId];
+
+        if ( bondDepository.isLiquidityBond ) {
+            return debtRatio(_bondDepositoryId).mul(
+                IBondCalculator( bondDepository.bondCalculator
+            ).markdown( bondDepository.principle ) ).div( 1e9 );
         } else {
-            return debtRatio();
+            return debtRatio(_bondDepositoryId);
         }
     }
 
@@ -1044,30 +1176,37 @@ contract OlympusBondDepository is Ownable {
      *  @notice calculate debt factoring in decay
      *  @return uint
      */
-    function currentDebt() public view returns ( uint ) {
-        return totalDebt.sub( debtDecay() );
+    function currentDebt(uint _bondDepositoryId) public view returns ( uint ) {
+        return bondDepositoriesDebts[_bondDepositoryId].totalDebt.sub( debtDecay(_bondDepositoryId) );
     }
 
     /**
      *  @notice amount to decay total debt by
      *  @return decay_ uint
      */
-    function debtDecay() public view returns ( uint decay_ ) {
-        uint blocksSinceLast = block.number.sub( lastDecay );
-        decay_ = totalDebt.mul( blocksSinceLast ).div( terms.vestingTerm );
-        if ( decay_ > totalDebt ) {
-            decay_ = totalDebt;
+    function debtDecay(uint _bondDepositoryId) public view returns ( uint decay_ ) {
+        BondDepositoryTerms memory terms = bondDepositoriesTerms[_bondDepositoryId];
+        BondDepositoryDebt memory bondDepositoryDebt = bondDepositoriesDebts[_bondDepositoryId];
+
+        uint blocksSinceLast = block.number.sub( bondDepositoryDebt.lastDecay );
+        decay_ = bondDepositoryDebt.totalDebt.mul( blocksSinceLast ).div( terms.vestingTerm );
+        if ( decay_ > bondDepositoryDebt.totalDebt ) {
+            decay_ = bondDepositoryDebt.totalDebt;
         }
     }
 
 
     /**
      *  @notice calculate how far into vesting a depositor is
+     *  @param _bondDepositoryId The index of bond depositories
      *  @param _depositor address
      *  @return percentVested_ uint
      */
-    function percentVestedFor( address _depositor ) public view returns ( uint percentVested_ ) {
-        Bond memory bond = bondInfo[ _depositor ];
+    function percentVestedFor(
+        uint _bondDepositoryId,
+        address _depositor
+    ) public view returns ( uint percentVested_ ) {
+        BondInfo memory bond = bondInfo[_bondDepositoryId][ _depositor ];
         uint blocksSinceLast = block.number.sub( bond.lastBlock );
         uint vesting = bond.vesting;
 
@@ -1083,9 +1222,12 @@ contract OlympusBondDepository is Ownable {
      *  @param _depositor address
      *  @return pendingPayout_ uint
      */
-    function pendingPayoutFor( address _depositor ) external view returns ( uint pendingPayout_ ) {
-        uint percentVested = percentVestedFor( _depositor );
-        uint payout = bondInfo[ _depositor ].payout;
+    function pendingPayoutFor(
+        uint _bondDepositoryId,
+        address _depositor
+    ) external view returns ( uint pendingPayout_ ) {
+        uint percentVested = percentVestedFor( _bondDepositoryId, _depositor );
+        uint payout = bondInfo[_bondDepositoryId][ _depositor ].payout;
 
         if ( percentVested >= 10000 ) {
             pendingPayout_ = payout;
@@ -1103,9 +1245,9 @@ contract OlympusBondDepository is Ownable {
      *  @notice allow anyone to send lost tokens (excluding principle or OHM) to the DAO
      *  @return bool
      */
-    function recoverLostToken( address _token ) external returns ( bool ) {
+    function recoverLostToken( uint _bondDepositoryId, address _token ) external returns ( bool ) {
         require( _token != OHM );
-        require( _token != principle );
+        require( _token != bondDepositories[_bondDepositoryId].principle );
         IERC20( _token ).safeTransfer( DAO, IERC20( _token ).balanceOf( address(this) ) );
         return true;
     }
